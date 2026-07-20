@@ -9,6 +9,7 @@ type JobLoader = () => Promise<JobModule>;
 
 const registry: Record<string, JobLoader> = {
   'hello-world': () => import('./jobs/hello-world/index'),
+  'reminders': () => import('./jobs/reminders/index'),
 };
 
 async function dispatch(): Promise<void> {
