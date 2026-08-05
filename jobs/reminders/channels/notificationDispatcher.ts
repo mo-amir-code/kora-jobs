@@ -1,7 +1,88 @@
 import { logger } from '../../../lib/logger';
 import { sendEmail } from '../../../lib/email';
+import { KORA_LOGO_LIGHT_MODE, KORA_APP_URL } from '../../../lib/constants';
 import { ReminderRule, ReminderProcessingResult } from '../types';
-import { getUserEmail, createReminderRuleLog, updateReminderRuleLastTriggeredAt } from '../repository';
+import { parseDurationToMs } from '../helpers/duration';
+import {
+  getUserEmail,
+  getPrimaryBrandContact,
+  getAllBrandContacts,
+  createReminderRuleLog,
+  hasReminderLogBeenSent,
+  getPreviousReminderLogTimestamp,
+  updateReminderRuleLastTriggeredAt,
+} from '../repository';
+
+/**
+ * Evaluates whether an item needs an initial reminder (followUpIndex: -1)
+ * or a specific follow-up step (followUpIndex: 0, 1, 2...) based on time elapsed since the previous log.
+ * Returns the followUpIndex to process, or null if skipping.
+ */
+export async function evaluateItemFollowUpStep(rule: ReminderRule, record: any): Promise<number | null> {
+  const dealId = record.dealId || record.id || null;
+  const userId = rule.userId;
+  const triggerType = rule.triggerType;
+  const resource = triggerType.includes('DELIVERABLE') ? record.id : null;
+
+  // 1. Check Initial Reminder (followUpIndex: -1)
+  const initialSent = await hasReminderLogBeenSent({
+    userId,
+    dealId,
+    triggerType,
+    resource,
+    followUpIndex: -1,
+  });
+
+  if (!initialSent) {
+    // Initial reminder has NOT been sent yet. Return -1 to send initial notification!
+    return -1;
+  }
+
+  // 2. Check Follow-ups if initial reminder WAS already sent
+  const followUps = rule.nextFollowUps || [];
+  if (followUps.length === 0) {
+    return null; // No follow-ups configured
+  }
+
+  for (let i = 0; i < followUps.length; i++) {
+    const followUpAlreadySent = await hasReminderLogBeenSent({
+      userId,
+      dealId,
+      triggerType,
+      resource,
+      followUpIndex: i,
+    });
+
+    if (!followUpAlreadySent) {
+      // Get previous step's log timestamp to check if required delay has elapsed
+      const prevStepIndex = i === 0 ? -1 : i - 1;
+      const prevLogTime = await getPreviousReminderLogTimestamp({
+        userId,
+        dealId,
+        triggerType,
+        resource,
+        followUpIndex: prevStepIndex,
+      });
+
+      if (!prevLogTime) {
+        return null;
+      }
+
+      const requiredDelayMs = parseDurationToMs(followUps[i]);
+      const timeElapsedMs = Date.now() - prevLogTime.getTime();
+
+      if (timeElapsedMs >= requiredDelayMs) {
+        // Required delay has passed for follow-up i! Return i.
+        return i;
+      }
+
+      // Time condition not yet met for this follow-up. Wait for future job runs.
+      return null;
+    }
+  }
+
+  return null; // All follow-ups already sent for this item
+}
 
 export async function dispatchNotifications(
   rule: ReminderRule,
@@ -14,40 +95,67 @@ export async function dispatchNotifications(
     return;
   }
 
-  logger.info(`[Notification Dispatcher] Processing notifications for rule "${rule.name || rule.id}" (${result.count} events matched)`);
+  // Evaluate which items are eligible for initial notification (-1) or a follow-up step (0..N)
+  const itemsToDispatch: { record: any; followUpIndex: number }[] = [];
+  for (const record of result.records) {
+    const followUpIdx = await evaluateItemFollowUpStep(rule, record);
+    if (followUpIdx !== null) {
+      itemsToDispatch.push({ record, followUpIndex: followUpIdx });
+    }
+  }
 
-  // Resolve target email recipients (replaces 'me' with user's registered email address)
-  const recipients = await resolveRecipients(rule);
+  if (itemsToDispatch.length === 0) {
+    logger.info(
+      `[Notification Dispatcher] Rule "${rule.name || rule.id}": All ${result.count} matched items have already been notified or are waiting for follow-up delay. Skipping.`
+    );
+    return;
+  }
+
+  logger.info(
+    `[Notification Dispatcher] Processing notifications for rule "${rule.name || rule.id}" (${itemsToDispatch.length} items eligible for dispatch)`
+  );
+
+  const dispatchResult: ReminderProcessingResult = {
+    ...result,
+    count: itemsToDispatch.length,
+    records: itemsToDispatch.map((i) => i.record),
+  };
 
   try {
     // 1. EMAIL CHANNEL
     if (rule.channelEmail) {
-      if (recipients.length === 0) {
-        throw new Error(`Email channel enabled for rule "${rule.name || rule.id}", but could not resolve any valid email address for user ${rule.userId}.`);
-      }
-
-      const emailSentSuccessfully = await sendAggregatedEmailNotification(rule, result, recipients);
+      const emailSentSuccessfully = await sendAggregatedEmailNotification(rule, dispatchResult);
       if (!emailSentSuccessfully) {
-        throw new Error(`Failed to send email to recipients: ${recipients.join(', ')}`);
+        throw new Error(`Failed to send email notifications for rule "${rule.name || rule.id}"`);
       }
     } else {
       logger.info(`[Email Channel] Rule "${rule.name || rule.id}": Disabled in rule configuration. Skipping.`);
     }
 
-    // 2. WHATSAPP CHANNEL (TODO STUB)
+    // 2. WHATSAPP CHANNEL (TODO STUB FOR INTEGRATION)
     if (rule.channelWhatsapp) {
-      processWhatsAppNotificationStub(rule, result);
+      await processWhatsAppNotificationStub(rule, dispatchResult);
     }
 
     const completedAt = new Date();
 
-    // Record SUCCESS in reminder_rule_logs table
-    await createReminderRuleLog({
-      reminderRuleId: rule.id,
-      status: 'SUCCESS',
-      startedAt,
-      completedAt,
-    });
+    // Record SUCCESS in reminder_rule_logs table for EACH dispatched item and its specific followUpIndex
+    for (const item of itemsToDispatch) {
+      const dealId = item.record.dealId || item.record.id || null;
+      const resource = rule.triggerType.includes('DELIVERABLE') ? item.record.id : null;
+
+      await createReminderRuleLog({
+        reminderRuleId: rule.id,
+        userId: rule.userId,
+        dealId,
+        triggerType: rule.triggerType,
+        resource,
+        followUpIndex: item.followUpIndex,
+        status: 'SUCCESS',
+        startedAt,
+        completedAt,
+      });
+    }
 
     // Update last_triggered_at on the reminder_rules table
     await updateReminderRuleLastTriggeredAt(rule.id, completedAt);
@@ -55,99 +163,236 @@ export async function dispatchNotifications(
   } catch (error: any) {
     logger.error(`[Notification Dispatcher] Error dispatching notifications for rule "${rule.name || rule.id}":`, error);
 
-    // Record FAILED in reminder_rule_logs table
-    await createReminderRuleLog({
-      reminderRuleId: rule.id,
-      status: 'FAILED',
-      startedAt,
-      completedAt: new Date(),
-      errorMessage: error?.message || String(error),
-    });
-  }
-}
+    // Record FAILED in reminder_rule_logs table for EACH item
+    for (const item of itemsToDispatch) {
+      const dealId = item.record.dealId || item.record.id || null;
+      const resource = rule.triggerType.includes('DELIVERABLE') ? item.record.id : null;
 
-export async function resolveRecipients(rule: ReminderRule): Promise<string[]> {
-  let userEmail: string | null = null;
-  const resolvedRecipients: string[] = [];
-
-  const rawRecipients = rule.recipients && rule.recipients.length > 0
-    ? rule.recipients
-    : ['me'];
-
-  for (const recipient of rawRecipients) {
-    const trimmed = recipient.trim();
-    if (trimmed.toLowerCase() === 'me') {
-      if (!userEmail) {
-        userEmail = await getUserEmail(rule.userId);
-      }
-      if (userEmail && !resolvedRecipients.includes(userEmail)) {
-        resolvedRecipients.push(userEmail);
-      }
-    } else if (trimmed.includes('@')) {
-      if (!resolvedRecipients.includes(trimmed)) {
-        resolvedRecipients.push(trimmed);
-      }
+      await createReminderRuleLog({
+        reminderRuleId: rule.id,
+        userId: rule.userId,
+        dealId,
+        triggerType: rule.triggerType,
+        resource,
+        followUpIndex: item.followUpIndex,
+        status: 'FAILED',
+        startedAt,
+        completedAt: new Date(),
+        errorMessage: error?.message || String(error),
+      });
     }
   }
-
-  // Fallback: If no email was resolved, fetch the rule owner's email directly
-  if (resolvedRecipients.length === 0) {
-    if (!userEmail) {
-      userEmail = await getUserEmail(rule.userId);
-    }
-    if (userEmail) {
-      resolvedRecipients.push(userEmail);
-    }
-  }
-
-  return resolvedRecipients;
 }
 
 /**
- * Groups matched items by Deal ID and sends ONLY ONE email per Deal.
+ * Interpolates template string placeholders (e.g. [Contact Name], [Brand Name], [Deal Amount], [Due Date], [Invoice Link])
+ * with real dynamic values from the record / deal.
+ */
+export function interpolatePlaceholders(
+  templateText: string,
+  record: any,
+  dealTitle: string,
+  brandName: string,
+  options: { isHtml?: boolean } = {}
+): string {
+  if (!templateText) return '';
+
+  const contactName = record?.contactName || record?.deals?.brand_contacts?.name || 'there';
+  const currencyVal = record?.currency || 'USD';
+  const symbol = currencyVal === 'INR' ? '₹' : '$';
+
+  const totalAmt = record?.dealAmount ?? record?.amount;
+  const totalAmountFormatted = totalAmt != null
+    ? `${symbol}${Number(totalAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '$0.00';
+
+  const paidAmt = record?.amountPaid ?? 0;
+  const amountPaidFormatted = `${symbol}${Number(paidAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  const dueAmt = record?.dueAmount ?? (totalAmt != null ? Math.max(0, totalAmt - paidAmt) : null);
+  const dueAmountFormatted = dueAmt != null
+    ? `${symbol}${Number(dueAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : totalAmountFormatted;
+
+  const rawDueDate = record?.dueDate || record?.paymentDueDate;
+  const dueDateFormatted = rawDueDate
+    ? new Date(rawDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+    : 'Due Soon';
+
+  const dealId = record?.dealId || record?.id;
+  const rawInvoiceUrl = dealId
+    ? `${KORA_APP_URL}/dashboard/deals/${dealId}`
+    : `${KORA_APP_URL}/dashboard/deals`;
+
+  const invoiceLink = options.isHtml
+    ? `<a href="${rawInvoiceUrl}" target="_blank" style="color: #088395; font-weight: 600; text-decoration: underline;">View Invoice / Deal</a>`
+    : rawInvoiceUrl;
+
+  const deliverableType = record?.type
+    ? `${record.type}${record.platform ? ` (${record.platform})` : ''}`
+    : 'Deliverable';
+
+  const replacements: Record<string, string> = {
+    '\\[Contact Name\\]': contactName,
+    '\\[Brand Name\\]': brandName,
+    '\\[Deal Name\\]': dealTitle,
+    '\\[Deal Title\\]': dealTitle,
+    '\\[Deal Amount\\]': totalAmountFormatted,
+    '\\[Total Amount\\]': totalAmountFormatted,
+    '\\[Due Amount\\]': dueAmountFormatted,
+    '\\[Remaining Amount\\]': dueAmountFormatted,
+    '\\[Amount Paid\\]': amountPaidFormatted,
+    '\\[Due Date\\]': dueDateFormatted,
+    '\\[Invoice Link\\]': invoiceLink,
+    '\\[Invoice Number\\]': record?.invoiceNumber || 'Invoice',
+    '\\[Deliverable Type\\]': deliverableType,
+
+    '\\{\\{contact_name\\}\\}': contactName,
+    '\\{\\{brand_name\\}\\}': brandName,
+    '\\{\\{deal_title\\}\\}': dealTitle,
+    '\\{\\{deal_amount\\}\\}': totalAmountFormatted,
+    '\\{\\{total_amount\\}\\}': totalAmountFormatted,
+    '\\{\\{due_amount\\}\\}': dueAmountFormatted,
+    '\\{\\{remaining_amount\\}\\}': dueAmountFormatted,
+    '\\{\\{amount_paid\\}\\}': amountPaidFormatted,
+    '\\{\\{due_date\\}\\}': dueDateFormatted,
+    '\\{\\{invoice_link\\}\\}': invoiceLink,
+  };
+
+  let result = templateText;
+  for (const [pattern, value] of Object.entries(replacements)) {
+    result = result.replace(new RegExp(pattern, 'gi'), value);
+  }
+
+  return result;
+}
+
+/**
+ * Returns default template text for a trigger type if no custom message template is provided.
+ */
+export function getDefaultMessageTemplate(triggerType: string): string {
+  switch (triggerType) {
+    case 'DELIVERABLE_OVERDUE':
+      return `Hey [Contact Name], the deliverable for [Brand Name] ([Deal Title]) was due on [Due Date] and is overdue. Please review details here: [Invoice Link]`;
+
+    case 'DELIVERABLE_DUE_SOON':
+      return `Hey [Contact Name], you have deliverables for [Brand Name] ([Deal Title]) due on [Due Date]. Please review details here: [Invoice Link]`;
+
+    case 'PAYMENT_DUE_SOON':
+      return `Hey [Contact Name], the payment of [Due Amount] for [Brand Name] ([Deal Title]) is due on [Due Date]. Please review details here: [Invoice Link]`;
+
+    case 'PAYMENT_OVERDUE':
+      return `Hey [Contact Name], the payment of [Due Amount] for [Brand Name] ([Deal Title]) was due on [Due Date] and is overdue. Please review details here: [Invoice Link]`;
+
+    case 'MISSING_INVOICE':
+      return `Hey [Contact Name], the deal for [Brand Name] ([Deal Title]) requires an invoice. Please review details here: [Invoice Link]`;
+
+    default:
+      return `Hey [Contact Name], here is an automated update for [Brand Name] ([Deal Title]). Please review details here: [Invoice Link]`;
+  }
+}
+
+/**
+ * Dispatches deal-aggregated emails based on rule recipient configuration:
+ * - "me": Sent to rule creator (without message template block).
+ * - "primary": Sent to deal/brand primary contact (with interpolated message template).
+ * - "all": Sent to all contacts of the deal's brand (with interpolated message template).
  */
 async function sendAggregatedEmailNotification(
   rule: ReminderRule,
-  result: ReminderProcessingResult,
-  recipients: string[]
+  result: ReminderProcessingResult
 ): Promise<boolean> {
   const records = result.records || [];
   if (records.length === 0) return true;
 
-  // Group records by Deal ID so each deal receives only 1 consolidated email
-  const dealsMap = new Map<string, { dealTitle: string; brandName: string; items: any[] }>();
+  const rawRecipients = rule.recipients && rule.recipients.length > 0 ? rule.recipients : ['me'];
+  const includesMe = rawRecipients.includes('me');
+  const includesPrimary = rawRecipients.includes('primary');
+  const includesAll = rawRecipients.includes('all');
+
+  const creatorEmail = await getUserEmail(rule.userId);
+
+  // Group records by Deal ID so each deal receives consolidated emails
+  const dealsMap = new Map<string, { dealTitle: string; brandName: string; brandId: string; contactId?: string | null; items: any[] }>();
 
   for (const record of records) {
     const dealKey = record.dealId || record.id || 'general_deal';
     const dealTitle = record.dealTitle || record.title || 'Deal Activity';
     const brandName = record.brandName || 'Brand Partner';
+    const brandId = record.brandId || record.deals?.brand_id || '';
+    const contactId = record.contactId || record.deals?.contact_id || null;
 
     if (!dealsMap.has(dealKey)) {
-      dealsMap.set(dealKey, { dealTitle, brandName, items: [] });
+      dealsMap.set(dealKey, { dealTitle, brandName, brandId, contactId, items: [] });
     }
     dealsMap.get(dealKey)!.items.push(record);
   }
 
   let allSentSuccessfully = true;
 
-  // Send 1 aggregated email per Deal
-  for (const [dealId, dealGroup] of dealsMap.entries()) {
-    const subject = buildDealEmailSubject(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items.length);
-    const html = buildDealEmailHtml(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items);
+  for (const [, dealGroup] of dealsMap.entries()) {
 
-    logger.info(
-      `[Email Channel] Sending 1 deal-aggregated email for Deal "${dealGroup.dealTitle}" (${dealGroup.brandName}) to ${recipients.join(', ')} listing ${dealGroup.items.length} items...`
-    );
+    // 1. RECIPIENT: "me" (Creator of rule — internal reminder without message template block)
+    if (includesMe || (!includesPrimary && !includesAll)) {
+      if (creatorEmail) {
+        const subject = buildDealEmailSubject(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items.length, true);
+        const html = buildDealEmailHtml(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items, { isForCreator: true });
 
-    const sent = await sendEmail({
-      to: recipients,
-      subject,
-      html,
-    });
+        logger.info(
+          `[Email Channel] Dispatching CREATOR ("me") email for Deal "${dealGroup.dealTitle}" to ${creatorEmail}...`
+        );
 
-    if (!sent) {
-      allSentSuccessfully = false;
+        const sent = await sendEmail({ to: creatorEmail, subject, html });
+        if (!sent) allSentSuccessfully = false;
+      }
     }
+
+    // 2. RECIPIENT: "primary" (Primary contact of the brand — with interpolated message template)
+    if (includesPrimary && dealGroup.brandId) {
+      const primaryContact = await getPrimaryBrandContact(dealGroup.brandId, dealGroup.contactId);
+      if (primaryContact?.email) {
+        const subject = buildDealEmailSubject(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items.length, false);
+        const html = buildDealEmailHtml(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items, {
+          isForCreator: false,
+          contactName: primaryContact.name,
+        });
+
+        logger.info(
+          `[Email Channel] Dispatching PRIMARY CONTACT ("${primaryContact.name}" <${primaryContact.email}>) email for Deal "${dealGroup.dealTitle}"...`
+        );
+
+        const sent = await sendEmail({ to: primaryContact.email, subject, html });
+        if (!sent) allSentSuccessfully = false;
+      } else {
+        logger.warn(`[Email Channel] "primary" recipient specified for rule "${rule.name || rule.id}", but no primary contact email found for brand ${dealGroup.brandId}`);
+      }
+    }
+
+    // 3. RECIPIENT: "all" (All contacts of the brand — with interpolated message template)
+    if (includesAll && dealGroup.brandId) {
+      const allContacts = await getAllBrandContacts(dealGroup.brandId);
+      const validContacts = allContacts.filter((c) => c.email);
+
+      if (validContacts.length > 0) {
+        for (const contact of validContacts) {
+          const subject = buildDealEmailSubject(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items.length, false);
+          const html = buildDealEmailHtml(rule, dealGroup.dealTitle, dealGroup.brandName, dealGroup.items, {
+            isForCreator: false,
+            contactName: contact.name,
+          });
+
+          logger.info(
+            `[Email Channel] Dispatching BRAND CONTACT ("${contact.name}" <${contact.email}>) email for Deal "${dealGroup.dealTitle}"...`
+          );
+
+          const sent = await sendEmail({ to: contact.email!, subject, html });
+          if (!sent) allSentSuccessfully = false;
+        }
+      } else {
+        logger.warn(`[Email Channel] "all" recipients specified for rule "${rule.name || rule.id}", but no contact emails found for brand ${dealGroup.brandId}`);
+      }
+    }
+
   }
 
   return allSentSuccessfully;
@@ -157,81 +402,267 @@ export function buildDealEmailSubject(
   rule: ReminderRule,
   dealTitle: string,
   brandName: string,
-  count: number
+  count: number,
+  isForCreator: boolean = false
 ): string {
   const badge = count > 1 ? `${count} Action Items` : 'Action Required';
-  return `Reminder: ${dealTitle} (${brandName}) — ${badge}`;
+  if (isForCreator) {
+    return `Reminder: ${dealTitle} (${brandName}) — ${badge}`;
+  }
+  if (rule.triggerType.includes('PAYMENT')) {
+    return `Payment Reminder: ${dealTitle} — ${badge}`;
+  }
+  return `Reminder: ${dealTitle} — ${badge}`;
 }
 
 export function buildDealEmailHtml(
   rule: ReminderRule,
   dealTitle: string,
   brandName: string,
-  records: any[]
+  records: any[],
+  options: { isForCreator?: boolean; contactName?: string } = {}
 ): string {
-  const ruleTitle = rule.name || `Reminder (${rule.triggerType})`;
-  const itemsHtml = formatDealItemsHtml(rule.triggerType, records);
+  const firstRecord = records[0] || {};
+  const triggerType = rule.triggerType;
+
+  // Header Title
+  let headerTitle = 'Reminder: Action Required';
+  let ctaButtonText = 'Review Details';
+
+  if (triggerType.includes('PAYMENT')) {
+    headerTitle = 'Payment Reminder';
+    ctaButtonText = 'Review Payment Details';
+  } else if (triggerType.includes('DELIVERABLE')) {
+    headerTitle = 'Deliverable Reminder';
+    ctaButtonText = 'Review Deliverable Details';
+  } else if (triggerType === 'MISSING_INVOICE') {
+    headerTitle = 'Invoice Required';
+    ctaButtonText = 'Review Invoice Details';
+  }
+
+  // Format Message Block (if not for creator)
+  let messageTextBlockHtml = '';
+  if (!options.isForCreator) {
+    const recordWithContact = {
+      ...firstRecord,
+      contactName: options.contactName || firstRecord.contactName,
+    };
+    const rawTemplate = rule.messageTemplate || getDefaultMessageTemplate(triggerType);
+    const interpolatedMessage = interpolatePlaceholders(rawTemplate, recordWithContact, dealTitle, brandName, { isHtml: true });
+
+    messageTextBlockHtml = `
+      <div style="margin-bottom: 24px; padding: 18px 20px; background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 0px;">
+        <div style="font-size: 14px; line-height: 1.65; color: #334155; white-space: pre-wrap;">${interpolatedMessage}</div>
+      </div>
+    `;
+  }
+
+  // Stats Grid (Amount Due & Status Badge)
+  let statLabel = 'Amount Due';
+  let statValue = '$0.00';
+  let statSubtext = '';
+  let badgeText = 'ACTION REQUIRED';
+  let badgeBg = '#FFE4E6';
+  let badgeColor = '#9F1239';
+  let badgeBorder = '#FECDD3';
+
+  const totalAmt = firstRecord.dealAmount ?? firstRecord.amount;
+  const paidAmt = firstRecord.amountPaid ?? 0;
+  const dueAmt = firstRecord.dueAmount ?? (totalAmt != null ? Math.max(0, totalAmt - paidAmt) : null);
+
+  const currencyVal = firstRecord.currency || 'USD';
+  const symbol = currencyVal === 'INR' ? '₹' : '$';
+
+  const dueAmountFormatted = dueAmt != null
+    ? `${symbol}${Number(dueAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '$0.00';
+
+  const totalAmountFormatted = totalAmt != null
+    ? `${symbol}${Number(totalAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '$0.00';
+
+  const paidAmountFormatted = `${symbol}${Number(paidAmt).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  if (triggerType.includes('PAYMENT')) {
+    statLabel = 'Amount Due';
+    statValue = dueAmountFormatted;
+    if (paidAmt > 0 && totalAmt != null) {
+      statSubtext = `<div style="font-size: 11px; color: #64748B; margin-top: 3px;">Total: ${totalAmountFormatted} &bull; Paid: ${paidAmountFormatted}</div>`;
+    }
+
+    if (triggerType.includes('OVERDUE')) {
+      badgeText = firstRecord.paymentStatus ? `OVERDUE (${firstRecord.paymentStatus})` : 'OVERDUE';
+      badgeBg = '#FEF2F2';
+      badgeColor = '#991B1B';
+      badgeBorder = '#FCA5A5';
+    } else {
+      badgeText = 'PAYMENT DUE';
+      badgeBg = '#EFF6FF';
+      badgeColor = '#1E40AF';
+      badgeBorder = '#BFDBFE';
+    }
+  } else if (triggerType.includes('DELIVERABLE')) {
+    statLabel = 'Pending Items';
+    statValue = `${records.length} ${records.length === 1 ? 'Deliverable' : 'Deliverables'}`;
+
+    if (triggerType.includes('OVERDUE')) {
+      badgeText = 'OVERDUE DELIVERABLE';
+      badgeBg = '#FEF2F2';
+      badgeColor = '#991B1B';
+      badgeBorder = '#FCA5A5';
+    } else {
+      badgeText = 'DELIVERABLE DUE SOON';
+      badgeBg = '#FFFBEB';
+      badgeColor = '#92400E';
+      badgeBorder = '#FDE68A';
+    }
+  } else if (triggerType === 'MISSING_INVOICE') {
+    statLabel = 'Invoice Status';
+    statValue = 'Missing Invoice';
+    badgeText = 'ACTION REQUIRED';
+    badgeBg = '#FFFBEB';
+    badgeColor = '#92400E';
+    badgeBorder = '#FDE68A';
+  }
+
+  // Formatting Due Date & Deal URL
+  const rawDueDate = firstRecord.dueDate || firstRecord.paymentDueDate;
+  const dueDateFormatted = rawDueDate
+    ? new Date(rawDueDate).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+    : 'Pending';
+
+  const dealId = firstRecord.dealId || firstRecord.id;
+  const dealUrl = dealId
+    ? `${KORA_APP_URL}/dashboard/deals/${dealId}`
+    : `${KORA_APP_URL}/dashboard/deals`;
+
+  const deliverableItemsHtml = triggerType.includes('DELIVERABLE')
+    ? `
+      <div style="font-size: 12px; font-weight: 700; color: #64748B; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.04em;">DELIVERABLE ITEMS</div>
+      ${formatDealItemsHtml(triggerType, records)}
+    `
+    : '';
 
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Kora Scheduled Reminder</title>
+  <title>Kora Notification</title>
 </head>
-<body style="margin: 0; padding: 0; background-color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0f172a; -webkit-font-smoothing: antialiased;">
-  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #f8fafc; padding: 40px 16px;">
+<body style="margin: 0; padding: 0; background-color: #F8FAFC; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #0F172A; -webkit-font-smoothing: antialiased;">
+  <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="background-color: #F8FAFC; padding: 40px 16px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);">
+        <table role="presentation" width="100%" border="0" cellspacing="0" cellpadding="0" style="max-width: 540px; background-color: #FFFFFF; border-radius: 0px; border: 1px solid #E2E8F0; overflow: hidden; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.02);">
           
-          <!-- Header -->
+          <!-- Content Padding Area -->
           <tr>
-            <td style="padding: 28px 32px 20px 32px; border-bottom: 1px solid #f1f5f9;">
-              <table width="100%" border="0" cellspacing="0" cellpadding="0">
+            <td style="padding: 36px 36px 28px 36px;">
+
+              <!-- Kora Light Mode Logo Header -->
+              <div style="margin-bottom: 24px;">
+                <table border="0" cellspacing="0" cellpadding="0">
+                  <tr>
+                    <td style="vertical-align: middle;">
+                      <img src="${KORA_LOGO_LIGHT_MODE}" height="28" alt="Kora" style="display: block; border: 0;" />
+                    </td>
+                    <td style="vertical-align: middle; padding-left: 8px;">
+                      <span style="font-size: 19px; font-weight: 800; color: #0F172A; letter-spacing: 0.05em; line-height: 28px;">KORA</span>
+                    </td>
+                  </tr>
+                </table>
+              </div>
+
+              <!-- Main Title Heading -->
+              <div style="font-size: 22px; font-weight: 800; color: #0F172A; margin-bottom: 20px; line-height: 1.3; letter-spacing: -0.01em;">
+                ${headerTitle}
+              </div>
+
+              <!-- Interpolated Message Body (External Contacts) -->
+              ${messageTextBlockHtml}
+
+              <!-- Highlight Stats Grid (Amount Due & Status) -->
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="margin-bottom: 24px;">
                 <tr>
-                  <td align="left" style="vertical-align: middle;">
-                    <div style="display: inline-block; background-color: #4f46e5; color: #ffffff; font-weight: 800; font-size: 16px; width: 32px; height: 32px; line-height: 32px; text-align: center; border-radius: 8px; vertical-align: middle; margin-right: 10px;">K</div>
-                    <span style="font-size: 18px; font-weight: 700; color: #0f172a; letter-spacing: -0.02em; vertical-align: middle;">KORA</span>
+                  <td width="55%" align="left" style="vertical-align: top;">
+                    <div style="font-size: 12px; font-weight: 600; color: #64748B; margin-bottom: 4px;">${statLabel}</div>
+                    <div style="font-size: 32px; font-weight: 800; color: #0F172A; line-height: 1.1; letter-spacing: -0.02em;">${statValue}</div>
+                    ${statSubtext}
                   </td>
-                  <td align="right" style="vertical-align: middle;">
-                    <span style="display: inline-block; background-color: #eef2ff; color: #4338ca; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 20px; border: 1px solid #c7d2fe;">${records.length} ${records.length === 1 ? 'Item' : 'Items'}</span>
+                  <td width="45%" align="left" style="vertical-align: top; padding-top: 4px;">
+                    <div style="font-size: 12px; font-weight: 600; color: #64748B; margin-bottom: 6px;">Status</div>
+                    <span style="display: inline-block; background-color: ${badgeBg}; color: ${badgeColor}; border: 1px solid ${badgeBorder}; font-size: 11px; font-weight: 700; padding: 4px 10px; border-radius: 0px; letter-spacing: 0.03em;">
+                      &#9888; ${badgeText}
+                    </span>
                   </td>
                 </tr>
               </table>
-            </td>
-          </tr>
 
-          <!-- Body Content -->
-          <tr>
-            <td style="padding: 32px;">
-              <!-- Deal Banner Card -->
-              <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-left: 4px solid #4f46e5; border-radius: 8px; padding: 20px; margin-bottom: 28px;">
-                <div style="font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; margin-bottom: 6px;">Deal Summary</div>
-                <div style="font-size: 20px; font-weight: 700; color: #0f172a; margin-bottom: 8px; line-height: 1.3;">${dealTitle}</div>
-                <div>
-                  <span style="display: inline-block; background-color: #ffffff; color: #334155; font-size: 13px; font-weight: 600; padding: 3px 10px; border-radius: 6px; border: 1px solid #cbd5e1; margin-right: 8px;">Brand: ${brandName}</span>
-                  <span style="display: inline-block; color: #64748b; font-size: 13px;">Rule: <strong>${ruleTitle}</strong></span>
-                </div>
+              <!-- Deal Summary Table Card (Light Mode Theme) -->
+              ${options.isForCreator ? `
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid #E2E8F0; border-radius: 0px; background-color: #FFFFFF; overflow: hidden; margin-bottom: 24px;">
+                <tr>
+                  <td colspan="3" style="padding: 12px 16px; background-color: #FAFAFA; border-bottom: 1px solid #E2E8F0; font-size: 13px; font-weight: 700; color: #0F172A;">
+                    Deal Summary
+                  </td>
+                </tr>
+                <tr>
+                  <td width="48%" style="padding: 14px 16px; border-right: 1px solid #E2E8F0; vertical-align: top;">
+                    <div style="font-size: 11px; font-weight: 600; color: #94A3B8; margin-bottom: 4px;">Project Name</div>
+                    <div style="font-size: 13px; font-weight: 700; color: #0F172A; line-height: 1.4;">${dealTitle}</div>
+                  </td>
+                  <td width="24%" style="padding: 14px 16px; border-right: 1px solid #E2E8F0; vertical-align: top;">
+                    <div style="font-size: 11px; font-weight: 600; color: #94A3B8; margin-bottom: 4px;">Brand</div>
+                    <div style="font-size: 13px; font-weight: 700; color: #0F172A;">${brandName}</div>
+                  </td>
+                  <td width="28%" style="padding: 14px 16px; vertical-align: top;">
+                    <div style="font-size: 11px; font-weight: 600; color: #94A3B8; margin-bottom: 4px;">Due Date</div>
+                    <div style="font-size: 13px; font-weight: 700; color: #0F172A;">${dueDateFormatted}</div>
+                  </td>
+                </tr>
+              </table>
+              ` : `
+              <table width="100%" border="0" cellspacing="0" cellpadding="0" style="border: 1px solid #E2E8F0; border-radius: 0px; background-color: #FFFFFF; overflow: hidden; margin-bottom: 24px;">
+                <tr>
+                  <td colspan="2" style="padding: 12px 16px; background-color: #FAFAFA; border-bottom: 1px solid #E2E8F0; font-size: 13px; font-weight: 700; color: #0F172A;">
+                    Deal Summary
+                  </td>
+                </tr>
+                <tr>
+                  <td width="65%" style="padding: 14px 16px; border-right: 1px solid #E2E8F0; vertical-align: top;">
+                    <div style="font-size: 11px; font-weight: 600; color: #94A3B8; margin-bottom: 4px;">Project Name</div>
+                    <div style="font-size: 13px; font-weight: 700; color: #0F172A; line-height: 1.4;">${dealTitle}</div>
+                  </td>
+                  <td width="35%" style="padding: 14px 16px; vertical-align: top;">
+                    <div style="font-size: 11px; font-weight: 600; color: #94A3B8; margin-bottom: 4px;">Due Date</div>
+                    <div style="font-size: 13px; font-weight: 700; color: #0F172A;">${dueDateFormatted}</div>
+                  </td>
+                </tr>
+              </table>
+              `}
+
+              <!-- Deliverable Line Items (if Deliverable Trigger) -->
+              ${deliverableItemsHtml}
+
+              <!-- Primary Action CTA Button (Kora Light Mode Teal Theme - Sharp Edges) -->
+              <div style="margin-top: 28px;">
+                <a href="${dealUrl}" target="_blank" style="display: block; width: 100%; box-sizing: border-box; text-align: center; background-color: #088395; color: #FFFFFF; font-size: 14px; font-weight: 700; padding: 13px 0; border-radius: 0px; text-decoration: none;">
+                  ${ctaButtonText}
+                </a>
               </div>
 
-              <!-- Action Items Header -->
-              <div style="font-size: 12px; font-weight: 700; color: #475569; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.05em;">Pending Action Items</div>
-
-              <!-- List of Items -->
-              ${itemsHtml}
-
             </td>
           </tr>
 
-          <!-- Footer -->
+          <!-- Light Mode Footer -->
           <tr>
-            <td style="padding: 24px 32px; background-color: #f8fafc; border-top: 1px solid #f1f5f9; text-align: center;">
-              <p style="font-size: 12px; color: #94a3b8; margin: 0 0 6px 0;">
-                Automated update sent from your Kora Workspace.
+            <td style="padding: 20px 36px; background-color: #FAFAFA; border-top: 1px solid #E2E8F0; text-align: center;">
+              <p style="font-size: 12px; color: #64748B; margin: 0 0 4px 0;">
+                Sent via <strong>Kora</strong>
               </p>
-              <p style="font-size: 11px; color: #cbd5e1; margin: 0;">
-                &copy; ${new Date().getFullYear()} Kora Platform Inc. All rights reserved.
+              <p style="font-size: 11px; color: #94A3B8; margin: 0;">
+                &copy; ${new Date().getFullYear()} Kora. All rights reserved.
               </p>
             </td>
           </tr>
@@ -246,70 +677,100 @@ export function buildDealEmailHtml(
 
 export function formatDealItemsHtml(triggerType: string, records: any[]): string {
   if (!records || records.length === 0) {
-    return '<p style="font-size: 14px; color: #64748b;">No items recorded.</p>';
+    return '<p style="font-size: 13px; color: #64748B;">No items recorded.</p>';
   }
 
   return records.map((record) => {
-    let tagBg = '#EEF2FF';
-    let tagColor = '#4338CA';
+    let tagBg = '#FFFBEB';
+    let tagBorder = '#FDE68A';
+    let tagColor = '#92400E';
     let tagText = 'DELIVERABLE';
     let title = record.type || 'Deliverable';
     let detailLines: string[] = [];
 
     if (triggerType.includes('DELIVERABLE')) {
-      tagBg = '#EEF2FF';
-      tagColor = '#4338CA';
-      tagText = triggerType.includes('OVERDUE') ? 'OVERDUE DELIVERABLE' : 'DELIVERABLE';
-      title = `${record.type || 'Deliverable'} (${record.platform || 'General'})`;
+      if (triggerType.includes('OVERDUE')) {
+        tagBg = '#FEF2F2';
+        tagBorder = '#FCA5A5';
+        tagColor = '#991B1B';
+        tagText = 'OVERDUE DELIVERABLE';
+      } else {
+        tagBg = '#FFFBEB';
+        tagBorder = '#FDE68A';
+        tagColor = '#92400E';
+        tagText = 'DELIVERABLE DUE SOON';
+      }
+      title = `${record.type || 'Deliverable'}${record.platform ? ` (${record.platform})` : ''}`;
       if (record.dueDate) {
-        detailLines.push(`Due Date: <strong>${new Date(record.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</strong>`);
+        detailLines.push(`Due Date: <strong style="color: #0F172A;">${new Date(record.dueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</strong>`);
       }
       if (record.quantity) {
-        detailLines.push(`Quantity: <strong>${record.quantity}</strong>`);
+        detailLines.push(`Quantity: <strong style="color: #0F172A;">${record.quantity}</strong>`);
       }
-    } else if (triggerType.includes('PAYMENT')) {
-      tagBg = '#ECFDF5';
-      tagColor = '#047857';
-      tagText = triggerType.includes('OVERDUE') ? 'OVERDUE PAYMENT' : 'PAYMENT DUE';
-      title = `Payment Amount: ${record.currency || 'USD'} ${record.amount ? record.amount.toLocaleString() : '0'}`;
-      if (record.paymentDueDate) {
-        detailLines.push(`Due Date: <strong>${new Date(record.paymentDueDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}</strong>`);
-      }
-      if (record.paymentStatus) {
-        detailLines.push(`Status: <strong>${record.paymentStatus}</strong>`);
-      }
-    } else if (triggerType === 'MISSING_INVOICE') {
-      tagBg = '#FEF3C7';
-      tagColor = '#B45309';
-      tagText = 'MISSING INVOICE';
-      title = `Deal Stage: ${record.stage || 'Active'}`;
-      detailLines.push(`Action Required: <strong>Create & send invoice</strong>`);
     }
 
     return `
-      <div style="background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px 20px; margin-bottom: 12px; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.02);">
-        <table width="100%" border="0" cellspacing="0" cellpadding="0">
-          <tr>
-            <td align="left" style="vertical-align: top;">
-              <span style="display: inline-block; background-color: ${tagBg}; color: ${tagColor}; font-size: 10px; font-weight: 700; padding: 3px 8px; border-radius: 4px; letter-spacing: 0.03em; margin-bottom: 8px;">${tagText}</span>
-              <div style="font-size: 15px; font-weight: 600; color: #0f172a; margin-bottom: 4px;">${title}</div>
-              <div style="font-size: 13px; color: #475569; line-height: 1.5;">${detailLines.join(' &bull; ')}</div>
-            </td>
-          </tr>
-        </table>
+      <div style="margin-bottom: 12px; padding: 14px 16px; background-color: #FAFAFA; border: 1px solid #E2E8F0; border-radius: 0px;">
+        <div style="margin-bottom: 6px;">
+          <span style="display: inline-block; background-color: ${tagBg}; color: ${tagColor}; border: 1px solid ${tagBorder}; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 0px; text-transform: uppercase; letter-spacing: 0.04em;">
+            ${tagText}
+          </span>
+        </div>
+        <div style="font-size: 13px; font-weight: 700; color: #0F172A; margin-bottom: 4px;">
+          ${title}
+        </div>
+        ${detailLines.length > 0 ? `
+          <div style="font-size: 12px; color: #64748B; line-height: 1.4;">
+            ${detailLines.join(' &bull; ')}
+          </div>
+        ` : ''}
       </div>
     `;
   }).join('');
 }
 
-function processWhatsAppNotificationStub(
+/**
+ * WhatsApp Notification Dispatcher Stub (Kept as TODO stub for integration)
+ */
+async function processWhatsAppNotificationStub(
   rule: ReminderRule,
   result: ReminderProcessingResult
 ): Promise<void> {
-  // TODO: Implement WhatsApp Channel Integration (e.g. Twilio / Meta WhatsApp Business API)
-  logger.info(
-    `[TODO: WHATSAPP CHANNEL] WhatsApp channel enabled for rule "${rule.name || rule.id}". ` +
-    `TODO STUB: Prepare and send WhatsApp message for ${result.count} matched events to user ${rule.userId}.`
-  );
-  return Promise.resolve();
+  const firstRecord = (result.records || [])[0] || {};
+  const dealTitle = firstRecord.dealTitle || firstRecord.title || 'Deal';
+  const brandName = firstRecord.brandName || 'Brand';
+  const brandId = firstRecord.brandId || firstRecord.deals?.brand_id || '';
+  const contactId = firstRecord.contactId || firstRecord.deals?.contact_id || null;
+
+  const rawRecipients = rule.recipients && rule.recipients.length > 0 ? rule.recipients : ['me'];
+
+  if (rawRecipients.includes('primary') && brandId) {
+    const primaryContact = await getPrimaryBrandContact(brandId, contactId);
+    if (primaryContact?.whatsapp) {
+      const rawTemplate = rule.messageTemplate || getDefaultMessageTemplate(rule.triggerType);
+      const interpolatedMessage = interpolatePlaceholders(rawTemplate, { ...firstRecord, contactName: primaryContact.name }, dealTitle, brandName);
+
+      logger.info(
+        `[TODO STUB: WHATSAPP INTEGRATION] WhatsApp to PRIMARY CONTACT ("${primaryContact.name}" <${primaryContact.whatsapp}>) for rule "${rule.name || rule.id}":\n"${interpolatedMessage}"`
+      );
+    }
+  }
+
+  if (rawRecipients.includes('all') && brandId) {
+    const allContacts = await getAllBrandContacts(brandId);
+    for (const c of allContacts.filter((ct) => ct.whatsapp)) {
+      const rawTemplate = rule.messageTemplate || getDefaultMessageTemplate(rule.triggerType);
+      const interpolatedMessage = interpolatePlaceholders(rawTemplate, { ...firstRecord, contactName: c.name }, dealTitle, brandName);
+
+      logger.info(
+        `[TODO STUB: WHATSAPP INTEGRATION] WhatsApp to BRAND CONTACT ("${c.name}" <${c.whatsapp}>) for rule "${rule.name || rule.id}":\n"${interpolatedMessage}"`
+      );
+    }
+  }
+
+  if (rawRecipients.includes('me')) {
+    logger.info(
+      `[TODO STUB: WHATSAPP INTEGRATION] WhatsApp internal reminder to CREATOR (User ID: ${rule.userId}) for rule "${rule.name || rule.id}"`
+    );
+  }
 }

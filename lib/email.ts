@@ -68,3 +68,10 @@ export async function sendEmail(options: SendEmailOptions): Promise<boolean> {
     return false;
   }
 }
+
+export function closeTransporter(): void {
+  if (transporter) {
+    transporter.close();
+    transporter = null;
+  }
+}

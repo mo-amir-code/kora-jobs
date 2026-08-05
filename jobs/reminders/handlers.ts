@@ -68,14 +68,14 @@ export async function processPaymentDue(
   const window = calculateReminderWindow(now, rule.offsetValue, rule.offsetUnit);
 
   logger.info(
-    `[Handler: PAYMENT_DUE] Rule ID: ${rule.id} | Window: ${window.startDate.toISOString()} -> ${window.endDate.toISOString()}`
+    `[Handler: PAYMENT_DUE_SOON] Rule ID: ${rule.id} | Window: ${window.startDate.toISOString()} -> ${window.endDate.toISOString()}`
   );
 
   const records = await getUpcomingPayments(window.startDate, window.endDate, rule.userId);
   const durationMs = Date.now() - startTime;
 
   logger.info(
-    `[Handler: PAYMENT_DUE] Rule ID: ${rule.id} | Records Found: ${records.length} | Execution Time: ${durationMs}ms`
+    `[Handler: PAYMENT_DUE_SOON] Rule ID: ${rule.id} | Records Found: ${records.length} | Execution Time: ${durationMs}ms`
   );
 
   return {

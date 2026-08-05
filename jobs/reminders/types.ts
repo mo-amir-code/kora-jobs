@@ -1,7 +1,7 @@
 export type ReminderTriggerType =
   | 'DELIVERABLE_DUE_SOON'
   | 'DELIVERABLE_OVERDUE'
-  | 'PAYMENT_DUE'
+  | 'PAYMENT_DUE_SOON'
   | 'PAYMENT_OVERDUE'
   | 'MISSING_INVOICE';
 
@@ -17,6 +17,7 @@ export interface ReminderRule {
   triggerType: ReminderTriggerType;
   offsetValue: number;
   offsetUnit: string;
+  nextFollowUps?: string[];
   recipients?: string[];
   messageTemplate?: string | null;
   channelEmail?: boolean;
@@ -38,6 +39,11 @@ export interface DeliverableRecord {
   completedAt: string | null;
   dealTitle?: string | null;
   brandName?: string | null;
+  contactName?: string | null;
+  dealAmount?: number | null;
+  amountPaid?: number;
+  dueAmount?: number | null;
+  currency?: string | null;
 }
 
 export interface DealRecord {
@@ -53,9 +59,11 @@ export interface DealRecord {
   paymentDueDate: string | null;
   paymentStatus: string;
   amountPaid: number;
+  dueAmount?: number | null;
   createdAt: string;
   dealTitle?: string | null;
   brandName?: string | null;
+  contactName?: string | null;
 }
 
 export interface InvoiceRecord {

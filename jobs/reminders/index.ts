@@ -1,8 +1,8 @@
 import { createJob } from '../../lib/job';
 import { logger } from '../../lib/logger';
-import { supabase } from '../../lib/supabase';
 import { ReminderRule, ReminderProcessingResult } from './types';
 import { dispatchNotifications } from './channels/notificationDispatcher';
+import { getReminderRules } from './repository';
 import {
   processDeliverableDueSoon,
   processDeliverableOverdue,
@@ -16,46 +16,13 @@ export const run = createJob(async () => {
   logger.info(`Current job timestamp: ${new Date().toISOString()}`);
 
   logger.info(`Fetching reminders rules...`);
-  const reminders = await getReminders();
+  const reminders = await getReminderRules();
   logger.info(`Found ${reminders.length} reminders`);
 
   await iterateOnEachReminderRule(reminders);
 
   logger.info("reminders job finished");
 });
-
-const getReminders = async (): Promise<ReminderRule[]> => {
-  logger.info("Getting reminders from Supabase");
-  const { data, error } = await supabase
-    .from('reminder_rules')
-    .select('*')
-    .eq('is_active', true);
-
-  if (error) {
-    logger.error("Error getting reminders", error);
-    throw error;
-  }
-
-  logger.info(`Found ${data.length} reminders`);
-
-  return (data || []).map((row: any) => ({
-    id: row.id,
-    userId: row.user_id,
-    templateId: row.template_id,
-    name: row.name,
-    triggerType: row.trigger_type,
-    offsetValue: row.offset_value,
-    offsetUnit: row.offset_unit || 'hours',
-    recipients: row.recipients || [],
-    messageTemplate: row.message_template,
-    channelEmail: row.channel_email,
-    channelWhatsapp: row.channel_whatsapp,
-    channelPush: row.channel_push,
-    isActive: row.is_active,
-    lastTriggeredAt: row.last_triggered_at,
-    createdAt: row.created_at,
-  }));
-};
 
 const iterateOnEachReminderRule = async (
   reminderRules: ReminderRule[]
@@ -92,7 +59,7 @@ const processReminderRule = async (
     case 'DELIVERABLE_OVERDUE':
       return await processDeliverableOverdue(reminderRule);
 
-    case 'PAYMENT_DUE':
+    case 'PAYMENT_DUE_SOON':
       return await processPaymentDue(reminderRule);
 
     case 'PAYMENT_OVERDUE':

@@ -45,24 +45,10 @@ export function getReminderTargetDate(referenceDate: Date, offsetValue: number, 
 export function calculateReminderWindow(referenceDate: Date, offsetValue: number, offsetUnit: string): ReminderWindow {
   const targetDate = getReminderTargetDate(referenceDate, offsetValue, offsetUnit);
 
-  const normalizedUnit = offsetUnit.toLowerCase().trim();
+  const startDate = new Date(referenceDate);
+  const endDate = new Date(targetDate);
 
-  if (normalizedUnit.includes('day') || normalizedUnit.includes('week') || normalizedUnit.includes('month')) {
-    // For day/week/month offsets, window spans start of day to end of day on target date
-    const startDate = new Date(targetDate);
-    startDate.setUTCHours(0, 0, 0, 0);
-
-    const endDate = new Date(targetDate);
-    endDate.setUTCHours(23, 59, 59, 999);
-
-    return { startDate, endDate };
-  } else {
-    // For hour/minute offsets, window is referenceDate to targetDate
-    const startDate = new Date(referenceDate);
-    const endDate = new Date(targetDate);
-
-    return { startDate, endDate };
-  }
+  return { startDate, endDate };
 }
 
 export function isWithinReminderWindow(targetDate: Date, window: ReminderWindow): boolean {

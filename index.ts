@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { logger } from './lib/logger';
+import { closeTransporter } from './lib/email';
 
 interface JobModule {
   run: () => Promise<void>;
@@ -18,6 +19,7 @@ async function dispatch(): Promise<void> {
 
   if (!jobName) {
     logger.error(`JOB_NAME environment variable is not defined. Available jobs: ${availableJobs.join(', ')}`);
+    closeTransporter();
     process.exit(1);
   }
 
@@ -25,6 +27,7 @@ async function dispatch(): Promise<void> {
 
   if (!loadJob) {
     logger.error(`Job "${jobName}" is not registered. Available jobs: ${availableJobs.join(', ')}`);
+    closeTransporter();
     process.exit(1);
   }
 
@@ -37,9 +40,11 @@ async function dispatch(): Promise<void> {
     }
     await jobModule.run();
     logger.info(`Job "${jobName}" completed successfully.`);
+    closeTransporter();
     process.exit(0);
   } catch (error) {
     logger.error(`Job "${jobName}" execution failed:`, error);
+    closeTransporter();
     process.exit(1);
   }
 }
